@@ -1,0 +1,167 @@
+pull_requests:
+  do_not_increment_build_number: true
+os: Visual Studio 2017
+configuration: Release
+platform: x64
+clone_depth: 1
+environment:
+  PGUSER: postgres
+  PGPASSWORD: Password12!
+  matrix:
+  - pg: 12.4-1
+  - pg: 11.8-3
+  - pg: 10.14-1
+  - pg: 9.6.19-1
+    force: 1
+  - pg: REL_13_STABLE
+  - pg: master
+    configuration: Debug
+matrix:
+  allow_failures:
+    - pg: master
+
+init: # Make %exe% available for caching
+- ps: |
+    if ("$env:PLATFORM" -eq "x64") {
+      $env:pf = "$env:ProgramFiles"
+      $env:x64 = "-x64"
+    } else {
+      $env:pf = "${env:ProgramFiles(x86)}"
+    }
+    $env:exe = "postgresql-$env:pg-windows$env:x64.exe"
+    [Environment]::SetEnvironmentVariable("exe", $env:exe, "Machine")
+
+install:
+- ps: |
+    Push-Location c:\Tools\vcpkg
+    & .\vcpkg integrate install
+    & .\vcpkg install sqlite3[tool]:x64-windows-static
+    Pop-Location
+    # http://www.databasesoup.com/2016/05/changing-postgresql-version-numbering.html
+    $env:pgversion = $env:pg -replace "\.\d+-\d+$", ""
+    # [Environment]::SetEnvironmentVariable("pgversion", $env:pgversion, "Machine")
+    $env:pgroot = "$env:pf\PostgreSQL\$env:pgversion"
+    if ("$env:pg" -notmatch "\.") {
+      $env:Path += ";C:\msys64\usr\bin;C:\Program Files (x86)\Microsoft Visual Studio 14.0\VC\bin\amd64"
+      git clone -q --depth 1 --branch $env:pg https://git.postgresql.org/git/postgresql.git c:\projects\postgresql
+      pushd c:\projects\postgresql
+      perl src\tools\msvc\build.pl
+      perl src\tools\msvc\install.pl "$env:pgroot"
+      popd
+    } else {
+      if (-not (Test-Path "$env:pgroot\bin") -or $env:force) {
+        if (-not (Test-Path "$env:exe")) {
+          Start-FileDownload "http://get.enterprisedb.com/postgresql/$env:exe"
+        }
+        & ".\$env:exe" --unattendedmodeui none --mode unattended --superpassword "$env:PGPASSWORD" --servicepassword "$env:PGPASSWORD" | Out-Null
+        Stop-Service "postgresql$env:x64-$env:pgversion"
+      }
+      & "C:\Program Files (x86)\Microsoft Visual Studio 14.0\VC\bin\amd64\dumpbin.exe" `
+        /dependents $env:pgroot\bin\postgres.exe | ?{$_ -match "vcruntime(\d+)"} |
+        %{Add-AppveyorMessage -Message "Linked runtime: $_" -Category Information}
+      # if ($env:PlatformToolset -notmatch $Matches[1]) {
+      #   Add-AppveyorMessage -Message "Platform toolset mismatch!" -Category Warning -Details "Change it to $($Matches[1])"
+      # }
+    }
+
+cache:
+- '%exe%'
+- c:\Tools\vcpkg\installed\
+
+build_script:
+- msbuild /p:configuration=%CONFIGURATION% /p:platform=%PLATFORM%
+          sqlite_fdw.vcxproj
+          /verbosity:minimal /logger:"C:\Program Files\AppVeyor\BuildAgent\Appveyor.MSBuildLogger.dll"
+
+after_build:
+- ps: |
+    $dll = ($env:PLATFORM -replace "x86", ".") + "\$env:CONFIGURATION\sqlite_fdw.dll"
+    Add-AppveyorMessage Packing -Category Information
+    New-Item -Name tmp\share\extension -ItemType "directory"
+    Copy-Item "*.sql" -Destination tmp\share\extension\
+    Copy-Item "*.control" -Destination tmp\share\extension\
+    Copy-Item License -Destination tmp\SQLITE_FDW_LICENSE
+    New-Item -Name tmp\lib -ItemType "directory"
+    New-Item -Name tmp\debug_symbols -ItemType "directory"
+    Copy-Item $dll -Destination tmp\lib
+    Copy-Item ($dll -replace "\.dll", ".pdb") -Destination tmp\debug_symbols
+    if ($env:APPVEYOR_REPO_TAG -eq "false") {
+      $env:APPVEYOR_REPO_TAG_NAME=${env:APPVEYOR_REPO_COMMIT}.SubString(0,8)
+    }
+    $zip = "sqlite_fdw-$env:APPVEYOR_REPO_TAG_NAME-pg$env:pgversion-windows-$env:PLATFORM.zip"
+    Compress-Archive -Path ".\tmp\*" -DestinationPath $zip
+
+test_script:
+- ps: |
+    $env:path += ";$env:pgroot\bin"
+    Add-AppveyorMessage "Copying the extension files to the PostgreSQL directories." -Category Information
+    Expand-Archive -LiteralPath $zip -DestinationPath $env:pgroot
+    if ("$env:pg" -notmatch "\.") {
+      Set-Content -path pg.pass -value "$env:pgpassword" -encoding ascii
+      initdb -A md5 -U "$env:PGUSER" --pwfile=pg.pass C:\pgdata
+      pg_ctl register -S demand -N "postgresql$env:x64-$env:pgversion" -D c:\pgdata
+    }
+    Start-Service postgresql$env:x64-$env:pgversion
+    New-Item -ItemType directory -Path /tmp, results/extra
+    $sqlite_db = '/tmp/sqlitefdw_test.db'
+    & cmd /c "\Tools\vcpkg\installed\x64-windows-static\tools\sqlite3-bin.exe $sqlite_db < sql/init.sql"
+    $acl = Get-Acl $sqlite_db
+    $permission = 'NETWORK SERVICE',"FullControl", "none", "none", "Allow"
+    $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule $permission
+    $acl.SetAccessRule($accessRule)
+    # extra
+    Copy-Item -Path sql/extra/*.data -Destination /tmp/
+    & cmd /c "\Tools\vcpkg\installed\x64-windows-static\tools\sqlite3-bin.exe /tmp/sqlitefdw_test_post.db < sql/extra/init_post.sql"
+    & cmd /c "\Tools\vcpkg\installed\x64-windows-static\tools\sqlite3-bin.exe /tmp/sqlitefdw_test_core.db < sql/extra/init_core.sql"
+    Set-Acl '/tmp/*.db' $acl
+
+    Add-AppveyorTest Regression -Framework pg_regress -FileName sql\ -Outcome Running
+    $env:Outcome="Passed"
+    $elapsed=(Measure-Command {
+      & pg_regress "--bindir=$env:pgroot\bin" --dbname=regression `
+             sqlite_fdw type aggregate 2>&1 |
+        %{ if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { $_ } } |
+          Out-Default
+      if ($LASTEXITCODE -ne 0) {
+        $env:Outcome="Failed"
+      }
+    }).TotalMilliseconds
+    Update-AppVeyorTest Regression -Framework pg_regress -FileName sql\ -Outcome "$env:Outcome" -Duration $elapsed
+    if ("$env:Outcome" -ne "Passed") {
+      type regression.diffs
+      $host.SetShouldExit($LastExitCode)
+    }
+
+    Add-AppveyorTest "Regression extra" -Framework pg_regress -FileName sql\extra\ -Outcome Running
+    $env:Outcome="Passed"
+    $elapsed=(Measure-Command {
+      & pg_regress "--bindir=$env:pgroot\bin" --dbname=regression `
+             extra/sqlite_fdw_post extra/float4 extra/float8 extra/int4 extra/int8 `
+             extra/numeric extra/join extra/limit extra/aggregates extra/prepare `
+             extra/select_having extra/select extra/insert extra/update extra/timestamp 2>&1 |
+        %{ if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { $_ } } |
+          Out-Default
+      if ($LASTEXITCODE -ne 0) {
+        $env:Outcome="Failed"
+      }
+    }).TotalMilliseconds
+    Update-AppVeyorTest "Regression extra" -Framework pg_regress -FileName sql\extra\ -Outcome "$env:Outcome" -Duration $elapsed
+    if ("$env:Outcome" -ne "Passed") {
+      type regression.diffs
+    }
+
+artifacts:
+- path: '*.zip'
+
+deploy:
+    # Deploy to GitHub Releases
+  - provider: GitHub
+    draft: false
+    prerelease: false
+    auth_token:
+      secure: iABKJh8cHPJuyS1vHu44URWBRQkcivQVFZ0NUpTRFqyMvHuhkv/qLKkB/XqoKpC7
+    on:
+      appveyor_repo_tag: true       # deploy on tag push only
+
+# on_finish:
+#   - ps: $blockRdp = $true; iex ((new-object net.webclient).DownloadString('https://raw.githubusercontent.com/appveyor/ci/master/scripts/enable-rdp.ps1'))
